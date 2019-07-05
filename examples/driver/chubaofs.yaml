@@ -7,7 +7,7 @@ clusterInfo:
 
 runtimeEnv:
   mntPoint: /mnt/chubaofs
-  clientPath: /etc/chubaofs
+  clientPath: /var/chubaofs
 
 pool:
   opensds-files-chubaofs:

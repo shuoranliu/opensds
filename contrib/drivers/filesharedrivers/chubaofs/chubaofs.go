@@ -22,7 +22,6 @@ import (
 	"os/exec"
 	"path"
 	"strings"
-	"time"
 
 	log "github.com/golang/glog"
 	. "github.com/opensds/opensds/contrib/drivers/utils/config"
@@ -33,7 +32,7 @@ import (
 )
 
 const (
-	DefaultConfPath = "/etc/chubaofs/driver/chubaofs.yaml"
+	DefaultConfPath = "/etc/opensds/driver/chubaofs.yaml"
 	NamePrefix      = "chubaofs"
 )
 
@@ -42,9 +41,21 @@ const (
 	KVolumeName = "volName"
 	KMasterAddr = "masterAddr"
 	KLogDir     = "logDir"
+	KWarnLogDir = "warnLogDir"
 	KLogLevel   = "logLevel"
 	KOwner      = "owner"
 	KProfPort   = "profPort"
+)
+
+const (
+	defaultLogLevel = "error"
+	defaultOwner    = "chubaofs"
+	defaultProfPort = "10094"
+)
+
+const (
+	clientConfigFileName = "client.json"
+	clientCmdName        = "cfs-client"
 )
 
 type ClusterInfo struct {
@@ -55,6 +66,9 @@ type ClusterInfo struct {
 type RuntimeEnv struct {
 	MntPoint   string `yaml:"mntPoint"`
 	ClientPath string `yaml:"clientPath"`
+	LogLevel   string `yaml:"logLevel"`
+	Owner      string `yaml:"owner"`
+	ProfPort   string `yaml:"profPort"`
 }
 
 type Config struct {
@@ -70,12 +84,17 @@ type Driver struct {
 
 func (d *Driver) Setup() error {
 	conf := &Config{}
-	d.conf = conf
 	path := config.CONF.OsdsDock.Backends.Chubaofs.ConfigPath
 	if "" == path {
 		path = DefaultConfPath
 	}
 	_, err := Parse(conf, path)
+
+	if conf.MntPoint == "" || conf.ClientPath == "" {
+		return errors.New(fmt.Sprintf("chubaofs: lack of necessary config, mntPoint(%v) clientPath(%v)", conf.MntPoint, conf.ClientPath))
+	}
+
+	d.conf = conf
 	return err
 }
 
@@ -92,16 +111,21 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (*FileShareSpec, e
 		return nil, errors.New(fmt.Sprintf("chubaofs: invalid client path", d.conf.ClientPath))
 	}
 
-	clientCmd := path.Join(d.conf.ClientPath, "bin", "cfs-client")
+	clientCmd := path.Join(d.conf.ClientPath, "bin", clientCmdName)
 	clientConf := path.Join(d.conf.ClientPath, "conf", opt.GetId())
 	clientLog := path.Join(d.conf.ClientPath, "log", opt.GetId())
+	clientWarnLog := path.Join(d.conf.ClientPath, "warnlog", opt.GetId())
 
 	if err = os.MkdirAll(clientConf, os.ModeDir); err != nil {
 		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientConf))
 	}
 
 	if err = os.MkdirAll(clientLog, os.ModeDir); err != nil {
-		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientConf))
+		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientLog))
+	}
+
+	if err = os.MkdirAll(clientWarnLog, os.ModeDir); err != nil {
+		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientWarnLog))
 	}
 
 	fi, err = os.Stat(d.conf.MntPoint)
@@ -133,10 +157,22 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (*FileShareSpec, e
 	mntConfig[KVolumeName] = opt.GetId()
 	mntConfig[KMasterAddr] = strings.Join(d.conf.MasterAddr, ",")
 	mntConfig[KLogDir] = clientLog
-	// FIXME: make configurable
-	mntConfig[KLogLevel] = "info"
-	mntConfig[KOwner] = "chubaofs"
-	mntConfig[KProfPort] = "10094"
+	mntConfig[KWarnLogDir] = clientWarnLog
+	if d.conf.LogLevel != "" {
+		mntConfig[KLogLevel] = d.conf.LogLevel
+	} else {
+		mntConfig[KLogLevel] = defaultLogLevel
+	}
+	if d.conf.Owner != "" {
+		mntConfig[KOwner] = d.conf.Owner
+	} else {
+		mntConfig[KOwner] = defaultOwner
+	}
+	if d.conf.ProfPort != "" {
+		mntConfig[KProfPort] = d.conf.ProfPort
+	} else {
+		mntConfig[KProfPort] = defaultProfPort
+	}
 
 	data, err := json.MarshalIndent(mntConfig, "", "    ")
 	if err != nil {
@@ -144,7 +180,7 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (*FileShareSpec, e
 		return nil, err
 	}
 
-	clientConfFile := path.Join(clientConf, "client.json")
+	clientConfFile := path.Join(clientConf, clientConfigFileName)
 
 	_, err = generateFile(clientConfFile, data)
 	if err != nil {
@@ -152,28 +188,16 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (*FileShareSpec, e
 		return nil, err
 	}
 
-	time.Sleep(time.Second * 5)
+	cmd := exec.Command(clientCmd, "-c", clientConfFile)
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		log.Errorf("chubaofs: failed to start client daemon, msg(%v) err(%v)", msg, err)
+		return nil, err
+	}
 
-	go func() {
-		log.Infof("Run client %v -c %v", clientCmd, clientConfFile)
-
-		defer func() {
-			umountCmd := exec.Command("umount", "-l", fsMntPoint)
-			umountCmd.Run()
-		}()
-
-		// FIXME: use RootExecuter
-		cmd := exec.Command(clientCmd, "-c", clientConfFile)
-		if e := cmd.Run(); e != nil {
-			log.Errorf("chubaofs: failed to run client, err(%v)", e)
-			return
-		}
-	}()
-
-	// FIXME: handle error
+	log.Infof("Start client daemon successful: %v -c %v", clientCmd, clientConfFile)
 
 	locations := make([]string, 1)
-	locations[0] = fsMntPoint // FIXME
+	locations[0] = fsMntPoint
 
 	fshare := &FileShareSpec{
 		BaseModel: &BaseModel{
