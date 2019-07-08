@@ -15,13 +15,8 @@
 package chubaofs
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
-	"path"
-	"strings"
 
 	log "github.com/golang/glog"
 	. "github.com/opensds/opensds/contrib/drivers/utils/config"
@@ -45,6 +40,10 @@ const (
 	KLogLevel   = "logLevel"
 	KOwner      = "owner"
 	KProfPort   = "profPort"
+)
+
+const (
+	KClientPath = "clientPath"
 )
 
 const (
@@ -102,104 +101,39 @@ func (d *Driver) Unset() error {
 	return nil
 }
 
-func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (*FileShareSpec, error) {
+func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (fshare *FileShareSpec, err error) {
 	log.Info("CreateFileShare ...")
 
-	// check runtime environments
-	fi, err := os.Stat(d.conf.ClientPath)
-	if err != nil || !fi.Mode().IsDir() {
-		return nil, errors.New(fmt.Sprintf("chubaofs: invalid client path", d.conf.ClientPath))
-	}
+	volName := opt.GetId()
+	volSize := opt.GetSize()
 
-	clientCmd := path.Join(d.conf.ClientPath, "bin", clientCmdName)
-	clientConf := path.Join(d.conf.ClientPath, "conf", opt.GetId())
-	clientLog := path.Join(d.conf.ClientPath, "log", opt.GetId())
-	clientWarnLog := path.Join(d.conf.ClientPath, "warnlog", opt.GetId())
-
-	if err = os.MkdirAll(clientConf, os.ModeDir); err != nil {
-		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientConf))
-	}
-
-	if err = os.MkdirAll(clientLog, os.ModeDir); err != nil {
-		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientLog))
-	}
-
-	if err = os.MkdirAll(clientWarnLog, os.ModeDir); err != nil {
-		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", clientWarnLog))
-	}
-
-	fi, err = os.Stat(d.conf.MntPoint)
-	if err != nil || !fi.Mode().IsDir() {
-		return nil, errors.New(fmt.Sprintf("chubaofs: invalid mount point %v", d.conf.MntPoint))
-	}
-
-	fsMntPoint := path.Join(d.conf.MntPoint, opt.GetId())
-	if err = os.MkdirAll(fsMntPoint, os.ModeDir); err != nil {
-		return nil, errors.New(fmt.Sprintf("chubaofs: failed to mkdir %v", fsMntPoint))
-	}
-
-	// do create volume
-
+	/*
+	 * Only the master raft leader can repsonse to create volume requests.
+	 */
 	leader, err := getClusterInfo(d.conf.MasterAddr[0])
 	if err != nil {
 		return nil, err
 	}
 
-	err = createVolume(leader, opt.GetId(), opt.Size)
+	err = createVolume(leader, volName, volSize)
 	if err != nil {
 		return nil, err
 	}
 
-	// do mount
-
-	mntConfig := make(map[string]interface{})
-	mntConfig[KMountPoint] = fsMntPoint
-	mntConfig[KVolumeName] = opt.GetId()
-	mntConfig[KMasterAddr] = strings.Join(d.conf.MasterAddr, ",")
-	mntConfig[KLogDir] = clientLog
-	mntConfig[KWarnLogDir] = clientWarnLog
-	if d.conf.LogLevel != "" {
-		mntConfig[KLogLevel] = d.conf.LogLevel
-	} else {
-		mntConfig[KLogLevel] = defaultLogLevel
-	}
-	if d.conf.Owner != "" {
-		mntConfig[KOwner] = d.conf.Owner
-	} else {
-		mntConfig[KOwner] = defaultOwner
-	}
-	if d.conf.ProfPort != "" {
-		mntConfig[KProfPort] = d.conf.ProfPort
-	} else {
-		mntConfig[KProfPort] = defaultProfPort
-	}
-
-	data, err := json.MarshalIndent(mntConfig, "", "    ")
+	configFiles, fsMntPoints, err := prepareConfigFiles(d, opt)
 	if err != nil {
-		log.Errorf("chubaofs: failed to generate client config file, err(%v)", err)
 		return nil, err
 	}
 
-	clientConfFile := path.Join(clientConf, clientConfigFileName)
-
-	_, err = generateFile(clientConfFile, data)
+	err = doMount(clientCmdName, configFiles)
 	if err != nil {
-		log.Errorf("chubaofs: failed to generate client config file, err(%v)", err)
+		doUmount(fsMntPoints)
 		return nil, err
 	}
 
-	cmd := exec.Command(clientCmd, "-c", clientConfFile)
-	if msg, err := cmd.CombinedOutput(); err != nil {
-		log.Errorf("chubaofs: failed to start client daemon, msg(%v) err(%v)", msg, err)
-		return nil, err
-	}
+	log.Infof("Start client daemon successful: volume name: %v", volName)
 
-	log.Infof("Start client daemon successful: %v -c %v", clientCmd, clientConfFile)
-
-	locations := make([]string, 1)
-	locations[0] = fsMntPoint
-
-	fshare := &FileShareSpec{
+	fshare = &FileShareSpec{
 		BaseModel: &BaseModel{
 			Id: opt.GetId(),
 		},
@@ -208,12 +142,13 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (*FileShareSpec, e
 		Description:      opt.GetDescription(),
 		AvailabilityZone: opt.GetAvailabilityZone(),
 		PoolId:           opt.GetPoolId(),
-		ExportLocations:  locations,
+		ExportLocations:  fsMntPoints,
 		Metadata: map[string]string{
-			KMountPoint: fsMntPoint,
-			KVolumeName: opt.GetId(),
+			KVolumeName: volName,
+			KClientPath: d.conf.ClientPath,
 		},
 	}
+
 	return fshare, nil
 }
 
