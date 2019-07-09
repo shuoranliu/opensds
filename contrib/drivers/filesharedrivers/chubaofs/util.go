@@ -1,6 +1,8 @@
 package chubaofs
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,24 @@ import (
 	pb "github.com/opensds/opensds/pkg/model/proto"
 )
 
+type RequestType int
+
+func (t RequestType) String() string {
+	switch t {
+	case createVolumeRequest:
+		return "CreateVolume"
+	case deleteVolumeRequest:
+		return "DeleteVolume"
+	default:
+	}
+	return "N/A"
+}
+
+const (
+	createVolumeRequest RequestType = iota
+	deleteVolumeRequest
+)
+
 type clusterInfoResponseData struct {
 	LeaderAddr string `json:"LeaderAddr"`
 }
@@ -27,7 +47,8 @@ type clusterInfoResponse struct {
 	Data *clusterInfoResponseData `json:"data"`
 }
 
-type createVolumeResponse struct {
+// Create and Delete Volume Response
+type generalVolumeResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data string `json:"data"`
@@ -74,46 +95,54 @@ func getClusterInfo(host string) (string, error) {
 	return resp.Data.LeaderAddr, nil
 }
 
-func createVolume(leader string, name string, size int64) error {
-	// Round up to Giga bytes
-	sizeInGB := (size + (1 << 30) - 1) >> 30
-	url := fmt.Sprintf("http://%s/admin/createVol?name=%s&capacity=%v&owner=chubaofs", leader, name, sizeInGB)
-	log.Infof("chubaofs: CreateVolume url(%v)", url)
+func createOrDeleteVolume(req RequestType, leader, name, owner string, size int64) error {
+	var url string
+
+	switch req {
+	case createVolumeRequest:
+		sizeInGB := (size + (1 << 30) - 1) >> 30 // Round up to Giga bytes
+		url = fmt.Sprintf("http://%s/admin/createVol?name=%s&capacity=%v&owner=%v", leader, name, sizeInGB, owner)
+	case deleteVolumeRequest:
+		key := md5.New()
+		if _, err := key.Write([]byte(owner)); err != nil {
+			return errors.New(fmt.Sprintf("chubaofs: failed to get md5 sum of owner err(%v)", err))
+		}
+		url = fmt.Sprintf("http://%s/vol/delete?name=%s&authKey=%v", leader, name, hex.EncodeToString(key.Sum(nil)))
+	default:
+		return errors.New("chubaofs: request type not recognized! %v")
+	}
+
+	log.Infof("chubaofs: %v url(%v)", req, url)
 
 	httpResp, err := http.Get(url)
 	if err != nil {
-		errmsg := fmt.Sprintf("chubaofs: CreateVolume failed, url(%v) err(%v)", url, err)
-		log.Error(errmsg)
+		errmsg := fmt.Sprintf("chubaofs: %v failed, url(%v) err(%v)", req, url, err)
 		return errors.New(errmsg)
 	}
 	defer httpResp.Body.Close()
 
 	body, err := ioutil.ReadAll(httpResp.Body)
 	if err != nil {
-		errmsg := fmt.Sprintf("chubaofs: CreateVolume failed to unmarshal, bodyLen(%d) err(%v)", len(body), err)
-		log.Error(errmsg)
+		errmsg := fmt.Sprintf("chubaofs: %v failed to read http response body, bodyLen(%d) err(%v)", req, len(body), err)
 		return errors.New(errmsg)
 	}
 
-	resp := &createVolumeResponse{}
+	resp := &generalVolumeResponse{}
 	if err := json.Unmarshal(body, resp); err != nil {
-		errmsg := fmt.Sprintf("chubaofs: GetClusterInfo code NOK, url(%v) code(%v) msg(%v)", url, resp.Code, resp.Msg)
-		log.Error(errmsg)
+		errmsg := fmt.Sprintf("chubaofs: %v failed to unmarshal, url(%v) msg(%v)", req, url, resp.Msg)
 		return errors.New(errmsg)
 	}
-
-	log.Infof("chubaofs: CreateVolume url(%v) resp(%v)", url, resp)
 
 	if resp.Code != 0 {
-		if resp.Code == 1 {
-			log.Warning("chubaofs: CreateVolume volume exist, url(%v) msg(%v)", url, resp.Msg)
+		if req == createVolumeRequest && resp.Code == 1 {
+			log.Warning("chubaofs: %v volume exist, url(%v) msg(%v)", req, url, resp.Msg)
 		} else {
-			errmsg := fmt.Sprintf("chubaofs: CreateVolume failed, url(%v) code(%v) msg(%v)", url, resp.Code, resp.Msg)
-			log.Error(errmsg)
+			errmsg := fmt.Sprintf("chubaofs: %v failed, url(%v) code(%v) msg(%v)", req, url, resp.Code, resp.Msg)
 			return errors.New(errmsg)
 		}
 	}
 
+	log.Infof("chubaofs: %v url(%v) successful!", req, url)
 	return nil
 }
 
@@ -142,7 +171,7 @@ func doMount(cmdName string, confFile []string) error {
 	return nil
 }
 
-func doUmount(mntPoints []string) {
+func doUmount(mntPoints []string) error {
 	env := []string{
 		fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
 	}
@@ -150,11 +179,15 @@ func doUmount(mntPoints []string) {
 	for _, mnt := range mntPoints {
 		cmd := exec.Command("umount", mnt)
 		cmd.Env = append(cmd.Env, env...)
-		cmd.CombinedOutput()
+		msg, err := cmd.CombinedOutput()
+		if err != nil {
+			return errors.New(fmt.Sprintf("chubaofs: failed to umount, msg: %v , err: %v", msg, err))
+		}
 	}
+	return nil
 }
 
-func prepareConfigFiles(d *Driver, opt *pb.CreateFileShareOpts) (configFiles, fsMntPoints []string, err error) {
+func prepareConfigFiles(d *Driver, opt *pb.CreateFileShareOpts) (configFiles, fsMntPoints []string, owner string, err error) {
 	volName := opt.GetId()
 	configFiles = make([]string, 0)
 	fsMntPoints = make([]string, 0)
@@ -183,7 +216,8 @@ func prepareConfigFiles(d *Driver, opt *pb.CreateFileShareOpts) (configFiles, fs
 	}()
 
 	if err = os.MkdirAll(clientLog, os.ModeDir); err != nil {
-		return nil, nil, errors.New(fmt.Sprintf("chubaofs: failed to create client log dir, path: %v", clientLog))
+		err = errors.New(fmt.Sprintf("chubaofs: failed to create client log dir, path: %v", clientLog))
+		return
 	}
 	defer func() {
 		if err != nil {
@@ -253,6 +287,8 @@ func prepareConfigFiles(d *Driver, opt *pb.CreateFileShareOpts) (configFiles, fs
 	} else {
 		mntConfig[KProfPort] = defaultProfPort
 	}
+
+	owner = mntConfig[KOwner].(string)
 
 	for i, mnt := range fsMntPoints {
 		mntConfig[KMountPoint] = mnt

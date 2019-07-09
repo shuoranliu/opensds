@@ -17,6 +17,8 @@ package chubaofs
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path"
 
 	log "github.com/golang/glog"
 	. "github.com/opensds/opensds/contrib/drivers/utils/config"
@@ -50,6 +52,8 @@ const (
 	defaultLogLevel = "error"
 	defaultOwner    = "chubaofs"
 	defaultProfPort = "10094"
+
+	defaultCapacityLimit int64 = 1000000
 )
 
 const (
@@ -107,6 +111,11 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (fshare *FileShare
 	volName := opt.GetId()
 	volSize := opt.GetSize()
 
+	configFiles, fsMntPoints, owner, err := prepareConfigFiles(d, opt)
+	if err != nil {
+		return nil, err
+	}
+
 	/*
 	 * Only the master raft leader can repsonse to create volume requests.
 	 */
@@ -115,12 +124,7 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (fshare *FileShare
 		return nil, err
 	}
 
-	err = createVolume(leader, volName, volSize)
-	if err != nil {
-		return nil, err
-	}
-
-	configFiles, fsMntPoints, err := prepareConfigFiles(d, opt)
+	err = createOrDeleteVolume(createVolumeRequest, leader, volName, owner, volSize)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +150,7 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (fshare *FileShare
 		Metadata: map[string]string{
 			KVolumeName: volName,
 			KClientPath: d.conf.ClientPath,
+			KOwner:      owner,
 		},
 	}
 
@@ -153,8 +158,47 @@ func (d *Driver) CreateFileShare(opt *pb.CreateFileShareOpts) (fshare *FileShare
 }
 
 func (d *Driver) DeleteFileShare(opts *pb.DeleteFileShareOpts) error {
-	// TODO
-	return nil
+	volName := opts.GetMetadata()[KVolumeName]
+	clientPath := opts.GetMetadata()[KClientPath]
+	owner := opts.GetMetadata()[KOwner]
+	fsMntPoints := make([]string, 0) //FIXME
+
+	/*
+	 * Umount export locations
+	 */
+	err := doUmount(fsMntPoints)
+	if err != nil {
+		return err
+	}
+
+	/*
+	 * Remove generated mount points dir
+	 */
+	for _, mnt := range fsMntPoints {
+		err = os.RemoveAll(mnt)
+		if err != nil {
+			return errors.New(fmt.Sprintf("chubaofs: failed to remove export locations, err: %v", err))
+		}
+	}
+
+	/*
+	 * Remove generated client runtime path
+	 */
+	err = os.RemoveAll(path.Join(clientPath, volName))
+	if err != nil {
+		return errors.New(fmt.Sprintf("chubaofs: failed to remove client path %v , volume name: %v , err: %v", clientPath, volName, err))
+	}
+
+	/*
+	 * Only the master raft leader can repsonse to delete volume requests.
+	 */
+	leader, err := getClusterInfo(d.conf.MasterAddr[0])
+	if err != nil {
+		return err
+	}
+	err = createOrDeleteVolume(deleteVolumeRequest, leader, volName, owner, 0)
+
+	return err
 }
 
 func (d *Driver) CreateFileShareSnapshot(opts *pb.CreateFileShareSnapshotOpts) (*FileShareSnapshotSpec, error) {
@@ -181,8 +225,8 @@ func (d *Driver) ListPools() ([]*StoragePoolSpec, error) {
 				Id: uuid.NewV5(uuid.NamespaceOID, name).String(),
 			},
 			Name:             name,
-			TotalCapacity:    200, // FIXME
-			FreeCapacity:     200, // FIXME
+			TotalCapacity:    defaultCapacityLimit,
+			FreeCapacity:     defaultCapacityLimit,
 			StorageType:      prop.StorageType,
 			Extras:           prop.Extras,
 			AvailabilityZone: prop.AvailabilityZone,
@@ -191,7 +235,6 @@ func (d *Driver) ListPools() ([]*StoragePoolSpec, error) {
 			pool.AvailabilityZone = "default"
 		}
 		pools = append(pools, pool)
-
 	}
 	return pools, nil
 }
